@@ -292,6 +292,7 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
       }
 
       logDebug(s"Received ${offers.size} resource offers.")
+      logDebug(s"Received offers from Mesos: \n${offers.asScala.mkString("\n")}")
 
       val (matchedOffers, unmatchedOffers) = offers.asScala.partition { offer =>
         val offerAttributes = toAttributeMap(offer.getAttributesList)
