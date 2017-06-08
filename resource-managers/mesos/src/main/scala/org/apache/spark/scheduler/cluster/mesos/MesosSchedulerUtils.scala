@@ -214,6 +214,8 @@ trait MesosSchedulerUtils extends Logging {
                           amountToUse: Double): (List[Resource], List[Resource]) = {
     var remain = amountToUse
     var requestedResources = new ArrayBuffer[Resource]
+    var revocable = false
+    var unRevocable = false
     val remainingResources = resources.asScala.map {
       case r =>
         if (remain > 0 &&
@@ -222,13 +224,19 @@ trait MesosSchedulerUtils extends Logging {
           r.getName == resourceName) {
           val usage = Math.min(remain, r.getScalar.getValue)
           if (r.hasRevocable) {
-            requestedResources += createResource(
-              resourceName,
-              usage,
-              Some(r.getRole),
-              revocable = true)
+            if (!unRevocable) {
+              requestedResources += createResource(
+                resourceName,
+                usage,
+                Some(r.getRole),
+                revocable = true)
+              revocable = true
+            }
           } else {
-            requestedResources += createResource(resourceName, usage, Some(r.getRole))
+            if (!revocable) {
+              requestedResources += createResource(resourceName, usage, Some(r.getRole))
+              unRevocable = true
+            }
           }
           remain -= usage
           createResource(resourceName, r.getScalar.getValue - usage, Some(r.getRole))
