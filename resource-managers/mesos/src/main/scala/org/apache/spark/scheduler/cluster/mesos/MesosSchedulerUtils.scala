@@ -97,6 +97,12 @@ trait MesosSchedulerUtils extends Logging {
     if (maxGpus > 0) {
       fwInfoBuilder.addCapabilities(Capability.newBuilder().setType(Capability.Type.GPU_RESOURCES))
     }
+    val oversubscribe = conf.getBoolean("spark.mesos.oversubscribe", false)
+    if (oversubscribe) {
+      fwInfoBuilder.addCapabilities(
+        Capability.newBuilder().setType(Capability.Type.REVOCABLE_RESOURCES)
+      )
+    }
     if (credBuilder.hasPrincipal) {
       new MesosSchedulerDriver(
         scheduler, fwInfoBuilder.build(), masterUrl, credBuilder.build())
@@ -147,7 +153,19 @@ trait MesosSchedulerUtils extends Logging {
   def getResource(res: JList[Resource], name: String): Double = {
     // A resource can have multiple values in the offer since it can either be from
     // a specific role or wildcard.
-    res.asScala.filter(_.getName == name).map(_.getScalar.getValue).sum
+    res.asScala.filter(_.getName == name).filter(!_.hasRevocable).map(_.getScalar.getValue).sum
+  }
+
+  def getRevocableResource(res: JList[Resource], name: String): Double = {
+    res.asScala.filter(_.getName == name).filter(_.hasRevocable).map(_.getScalar.getValue).sum
+  }
+
+  def isRevocableExecutor(executor: ExecutorInfo): Boolean = {
+    var revocable = false
+    executor.getResourcesList.asScala.foreach { r =>
+        revocable = revocable || r.hasRevocable
+    }
+    revocable
   }
 
   /**
@@ -175,11 +193,16 @@ trait MesosSchedulerUtils extends Logging {
     registerLatch.countDown()
   }
 
-  def createResource(name: String, amount: Double, role: Option[String] = None): Resource = {
+  def createResource(name: String, amount: Double, role: Option[String] = None,
+                     revocable: Boolean = false): Resource = {
     val builder = Resource.newBuilder()
       .setName(name)
       .setType(Value.Type.SCALAR)
       .setScalar(Value.Scalar.newBuilder().setValue(amount).build())
+
+    if (revocable) {
+      builder.setRevocable(Resource.RevocableInfo.newBuilder().build())
+    }
 
     role.foreach { r => builder.setRole(r) }
 
@@ -198,7 +221,8 @@ trait MesosSchedulerUtils extends Logging {
   def partitionResources(
       resources: JList[Resource],
       resourceName: String,
-      amountToUse: Double): (List[Resource], List[Resource]) = {
+      amountToUse: Double,
+      revocable: Boolean = false): (List[Resource], List[Resource]) = {
     var remain = amountToUse
     var requestedResources = new ArrayBuffer[Resource]
     val remainingResources = resources.asScala.map {
@@ -206,11 +230,12 @@ trait MesosSchedulerUtils extends Logging {
         if (remain > 0 &&
           r.getType == Value.Type.SCALAR &&
           r.getScalar.getValue > 0.0 &&
-          r.getName == resourceName) {
+          r.getName == resourceName &&
+          r.hasRevocable == revocable) {
           val usage = Math.min(remain, r.getScalar.getValue)
-          requestedResources += createResource(resourceName, usage, Some(r.getRole))
+          requestedResources += createResource(resourceName, usage, Some(r.getRole), revocable)
           remain -= usage
-          createResource(resourceName, r.getScalar.getValue - usage, Some(r.getRole))
+          createResource(resourceName, r.getScalar.getValue - usage, Some(r.getRole), revocable)
         } else {
           r
         }

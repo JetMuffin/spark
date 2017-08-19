@@ -48,6 +48,7 @@ private[spark] class MesosFineGrainedSchedulerBackend(
 
   // Stores the slave ids that has launched a Mesos executor.
   val slaveIdToExecutorInfo = new HashMap[String, MesosExecutorInfo]
+  val slaveIdToRevocableExecutorInfo = new HashMap[String, MesosExecutorInfo]
   val taskIdToSlaveId = new HashMap[Long, String]
 
   // An ExecutorInfo for our tasks
@@ -99,7 +100,8 @@ private[spark] class MesosFineGrainedSchedulerBackend(
    */
   def createExecutorInfo(
       availableResources: JList[Resource],
-      execId: String): (MesosExecutorInfo, JList[Resource]) = {
+      execId: String,
+      revocable: Boolean = false): (MesosExecutorInfo, JList[Resource]) = {
     val executorSparkHome = sc.conf.getOption("spark.mesos.executor.home")
       .orElse(sc.getSparkHome()) // Fall back to driver Spark home for backward compatibility
       .getOrElse {
@@ -145,9 +147,9 @@ private[spark] class MesosFineGrainedSchedulerBackend(
     }
     val builder = MesosExecutorInfo.newBuilder()
     val (resourcesAfterCpu, usedCpuResources) =
-      partitionResources(availableResources, "cpus", mesosExecutorCores)
+      partitionResources(availableResources, "cpus", mesosExecutorCores, revocable)
     val (resourcesAfterMem, usedMemResources) =
-      partitionResources(resourcesAfterCpu.asJava, "mem", executorMemory(sc))
+      partitionResources(resourcesAfterCpu.asJava, "mem", executorMemory(sc), revocable)
 
     builder.addAllResources(usedCpuResources.asJava)
     builder.addAllResources(usedMemResources.asJava)
@@ -271,8 +273,31 @@ private[spark] class MesosFineGrainedSchedulerBackend(
         meetsRequirements
       }
 
+      val (usableRevocableOffers, unUsableRevocableOffers) =
+        unUsableOffers.partition { o =>
+          val revocableMem = getRevocableResource(o.getResourcesList, "mem")
+          val revocableCpus = getRevocableResource(o.getResourcesList, "cpus")
+          val slaveId = o.getSlaveId.getValue
+
+          // check revocable resources in offer for
+          //  1. Memory requirements
+          //  2. CPU requirements - need at least 1 for executor, 1 for task
+          val meetsMemoryRequirements = revocableMem >= executorMemory(sc)
+          val meetsCPURequirements =
+            revocableCpus >= (mesosExecutorCores + scheduler.CPUS_PER_TASK)
+          val meetsRequirements =
+            (meetsMemoryRequirements && meetsCPURequirements) ||
+              (slaveIdToRevocableExecutorInfo.contains(slaveId) &&
+                revocableCpus >= scheduler.CPUS_PER_TASK)
+          val debugstr = if (meetsRequirements) "Accepting" else "Declining"
+          logDebug(s"$debugstr revocable offer: ${o.getId.getValue} with resource"
+            + s"mem: $revocableMem cpu: $revocableCpus")
+
+          meetsRequirements
+      }
+
       // Decline offers we ruled out immediately
-      unUsableOffers.foreach(o => d.declineOffer(o.getId))
+      unUsableRevocableOffers.foreach(o => d.declineOffer(o.getId))
 
       val workerOffers = usableOffers.map { o =>
         val cpus = if (slaveIdToExecutorInfo.contains(o.getSlaveId.getValue)) {
@@ -317,6 +342,48 @@ private[spark] class MesosFineGrainedSchedulerBackend(
           }
         }
 
+      val revocableWorkerOffers = usableRevocableOffers.map { o =>
+        val revocableCpus = if (slaveIdToRevocableExecutorInfo.contains(o.getSlaveId.getValue)) {
+          getRevocableResource(o.getResourcesList, "cpus").toInt
+        } else {
+          (getRevocableResource(o.getResourcesList, "cpus") - mesosExecutorCores).toInt
+        }
+        new WorkerOffer(
+          o.getSlaveId.getValue,
+          o.getHostname,
+          revocableCpus,
+          true)
+      }.toIndexedSeq
+
+      val slaveIdToRevocableOffer = usableRevocableOffers.map(o => o.getSlaveId.getValue -> o).toMap
+      val slaveIdToRevocableWorkerOffer = revocableWorkerOffers.map(o => o.executorId -> o).toMap
+      val slaveIdToRevocableResources = new HashMap[String, JList[Resource]]()
+      usableRevocableOffers.foreach { o =>
+        slaveIdToRevocableResources(o.getSlaveId.getValue) = o.getResourcesList
+      }
+
+      val mesosRevocableTasks = new HashMap[String, JArrayList[MesosTaskInfo]]
+      val slavesIdsOfAcceptedRevocableOffers = HashSet[String]()
+
+      val acceptedRevocableOffers =
+        scheduler.resourceOffers(revocableWorkerOffers).filter(!_.isEmpty)
+      acceptedRevocableOffers
+        .foreach { offer =>
+          offer.foreach { taskDesc =>
+            val slaveId = taskDesc.executorId
+            slavesIdsOfAcceptedRevocableOffers += slaveId
+            taskIdToSlaveId(taskDesc.taskId) = slaveId
+            val (mesosTask, remainingResources) = createMesosTask(
+              taskDesc,
+              slaveIdToRevocableResources(slaveId),
+              slaveId,
+              revocable = true)
+            mesosRevocableTasks.getOrElseUpdate(slaveId, new JArrayList[MesosTaskInfo])
+              .add(mesosTask)
+            slaveIdToRevocableResources(slaveId) = remainingResources
+          }
+        }
+
       // Reply to the offers
       val filters = Filters.newBuilder().setRefuseSeconds(1).build() // TODO: lower timeout?
 
@@ -330,9 +397,24 @@ private[spark] class MesosFineGrainedSchedulerBackend(
         d.launchTasks(Collections.singleton(slaveIdToOffer(slaveId).getId), tasks, filters)
       }
 
+      mesosRevocableTasks.foreach { case (slaveId, tasks) =>
+        slaveIdToRevocableWorkerOffer.get(slaveId).foreach(o =>
+          listenerBus.post(SparkListenerExecutorAdded(System.currentTimeMillis(), slaveId,
+            // TODO: Add support for log urls for Mesos
+            new ExecutorInfo(o.host, o.cores, Map.empty)))
+        )
+        logTrace(s"Launching Mesos tasks on slave '$slaveId', tasks:\n${getTasksSummary(tasks)}")
+        d.launchTasks(Collections.singleton(slaveIdToRevocableOffer(slaveId).getId), tasks, filters)
+      }
+
       // Decline offers that weren't used
       // NOTE: This logic assumes that we only get a single offer for each host in a given batch
       for (o <- usableOffers if !slavesIdsOfAcceptedOffers.contains(o.getSlaveId.getValue)) {
+        d.declineOffer(o.getId)
+      }
+
+      for (o <- usableRevocableOffers
+           if !slavesIdsOfAcceptedRevocableOffers.contains(o.getSlaveId.getValue)) {
         d.declineOffer(o.getId)
       }
     }
@@ -342,16 +424,29 @@ private[spark] class MesosFineGrainedSchedulerBackend(
   def createMesosTask(
       task: TaskDescription,
       resources: JList[Resource],
-      slaveId: String): (MesosTaskInfo, JList[Resource]) = {
+      slaveId: String,
+      revocable: Boolean = false): (MesosTaskInfo, JList[Resource]) = {
     val taskId = TaskID.newBuilder().setValue(task.taskId.toString).build()
-    val (executorInfo, remainingResources) = if (slaveIdToExecutorInfo.contains(slaveId)) {
-      (slaveIdToExecutorInfo(slaveId), resources)
+    val (executorInfo, remainingResources) = if (!revocable) {
+      if (slaveIdToExecutorInfo.contains(slaveId)) {
+        (slaveIdToExecutorInfo(slaveId), resources)
+      } else {
+        createExecutorInfo(resources, slaveId)
+      }
     } else {
-      createExecutorInfo(resources, slaveId)
+      if (slaveIdToRevocableExecutorInfo.contains(slaveId)) {
+        (slaveIdToRevocableExecutorInfo(slaveId), resources)
+      } else {
+        createExecutorInfo(resources, slaveId, revocable)
+      }
     }
-    slaveIdToExecutorInfo(slaveId) = executorInfo
+    if (revocable) {
+      slaveIdToExecutorInfo(slaveId) = executorInfo
+    } else {
+      slaveIdToRevocableExecutorInfo(slaveId) = executorInfo
+    }
     val (finalResources, cpuResources) =
-      partitionResources(remainingResources, "cpus", scheduler.CPUS_PER_TASK)
+      partitionResources(remainingResources, "cpus", scheduler.CPUS_PER_TASK, revocable)
     val taskInfo = MesosTaskInfo.newBuilder()
       .setTaskId(taskId)
       .setSlaveId(SlaveID.newBuilder().setValue(slaveId).build())
